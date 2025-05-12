@@ -17,7 +17,7 @@
 #include <unistd.h>
 #include <vector>
 
-
+using namespace std::chrono;
 
 #define byteSwap32(x) (((x) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | ((x) << 24))
 #define byteSwap64(x)                                                          \
@@ -210,7 +210,9 @@ __global__ void expandAndHashKernel(
     const uint32_t *d_payload_lengths,
     uint32_t *d_hashes,
     const unsigned char *key,
-    unsigned char *d_modified_headers)
+    unsigned char *d_modified_headers,
+    const uint32_t *d_extracted_hashes,
+    uint8_t *d_match_flags)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int start_idx = idx * PACKETS_PER_THREAD;
@@ -223,77 +225,73 @@ __global__ void expandAndHashKernel(
         if (packet_idx >= num_packets) return;
 
         const unsigned char *in = &d_headers_20b[packet_idx * 20];
-        unsigned char expanded[56];       // Only real packet header
-        unsigned char expanded_with_key[120]; // For hashing only (56 + 64)
+        unsigned char expanded[56];             // Modified IPv4 header
+        unsigned char expanded_with_key[120];   // Input for hashing (header + key)
 
         // Step 1: Copy original 20-byte IPv4 header
         for (int j = 0; j < 20; ++j)
             expanded[j] = in[j];
 
         // Step 2: Set Version=4 and IHL=14 (56 bytes)
-        expanded[0] = (4 << 4) | 0xE; // 0x4E
+        expanded[0] = (4 << 4) | 0xE;
 
         // Step 3: Zero checksum
         expanded[10] = 0;
         expanded[11] = 0;
 
-        // Step 4: Insert IP options
-        expanded[20] = 0x82;  // Option type
-        expanded[21] = 34;    // Option length
-
+        // Step 4: Insert IP options (Option type = 0x82, length = 34)
+        expanded[20] = 0x82;
+        expanded[21] = 34;
         for (int j = 0; j < 32; ++j)
-            expanded[22 + j] = 0x00; // Placeholder for hash
+            expanded[22 + j] = 0x00;
 
-        // Step 5: Insert 2-byte padding
+        // Step 5: 2-byte padding
         expanded[54] = 0x00;
         expanded[55] = 0x00;
 
-        // Step 6: Prepare buffer for hashing
+        // Step 6: Prepare 120-byte buffer for hashing
         for (int j = 0; j < 56; ++j)
             expanded_with_key[j] = expanded[j];
-
         for (int j = 0; j < 64; ++j)
             expanded_with_key[56 + j] = key[j];
 
-        // Step 7: Hash over 120 bytes (header + key)
+        // Step 7: Hash the 120 bytes
         uint32_t local_hash[HASH_SIZE];
         calculateHashFromMemory(expanded_with_key, 120, local_hash);
 
-        /*if (packet_idx == 443) {
-            for (int k = 0; k < 8; ++k)
-                printf("HASH[%d] = %08x\n", k, local_hash[k]);
-        }*/
-
-        // Step 8: Insert hash into expanded header options
-        for (int i = 0; i < 8; ++i) {
-            expanded[22 + i * 4 + 0] = (local_hash[i] >> 24) & 0xFF;
-            expanded[22 + i * 4 + 1] = (local_hash[i] >> 16) & 0xFF;
-            expanded[22 + i * 4 + 2] = (local_hash[i] >> 8) & 0xFF;
-            expanded[22 + i * 4 + 3] = (local_hash[i]) & 0xFF;
+        // Step 8: Insert hash into header options
+        for (int j = 0; j < 8; ++j) {
+            expanded[22 + j * 4 + 0] = (local_hash[j] >> 24) & 0xFF;
+            expanded[22 + j * 4 + 1] = (local_hash[j] >> 16) & 0xFF;
+            expanded[22 + j * 4 + 2] = (local_hash[j] >> 8)  & 0xFF;
+            expanded[22 + j * 4 + 3] =  local_hash[j]        & 0xFF;
         }
 
-        // Step 9: Set correct Total Length (56 bytes + payload)
-        /*uint16_t total_len = 56 + d_payload_lengths[packet_idx];
-        expanded[2] = (total_len >> 8) & 0xFF;
-        expanded[3] = total_len & 0xFF;*/
-
-        // Step 10: Recompute checksum over real 56-byte IPv4 header
+        // Step 9: Recompute checksum on 56-byte header
         uint16_t csum = compute_checksum(expanded, 56);
         expanded[10] = (csum >> 8) & 0xFF;
         expanded[11] = csum & 0xFF;
 
-        // Step 11: Store hash output separately
+        // Step 10: Store hash in global memory
         for (int j = 0; j < HASH_SIZE; ++j)
             d_hashes[packet_idx * HASH_SIZE + j] = local_hash[j];
 
-        // Step 12: Write only 56 bytes of expanded header to output
+        // Step 11: Write modified header to output
         unsigned char *out = &d_modified_headers[packet_idx * 56];
         for (int j = 0; j < 56; ++j)
             out[j] = expanded[j];
+
+        // Step 12: Compare against extracted hash
+        bool match = true;
+        for (int j = 0; j < HASH_SIZE; ++j) {
+            if (local_hash[j] != d_extracted_hashes[packet_idx * HASH_SIZE + j]) {
+                match = false;
+                break;
+            }
+        }
+        d_match_flags[packet_idx] = match ? 1 : 0;
     }
 }
-
-
 
 const char *HMAC_KEY = "thisisaverysecure64bytehmacauthenticationkey12345678901234567890";
 
@@ -302,6 +300,8 @@ int main() {
     int server_fd, client_fd;
     struct sockaddr_in address{};
     int addrlen = sizeof(address);
+
+    auto t_recv_start = high_resolution_clock::now();
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -359,15 +359,14 @@ int main() {
         for (int i = 0; i < HASH_SIZE; ++i) {
             uint32_t h;
             memcpy(&h, ip_start + 22 + i * 4, sizeof(uint32_t));
-            h = ntohl(h);  // Big-endian to host
+            h = ntohl(h);
             extracted_hashes.push_back(h);
         }
 
         packet_count++;
     }
 
-    std::cout << "[Receiver] Captured " << packet_count << " packets\n";
-
+    auto t_recv_end = high_resolution_clock::now();
     if (packet_count == 0) {
         std::cerr << "[Receiver] No packets received. Exiting.\n";
         close(client_fd);
@@ -375,50 +374,51 @@ int main() {
         return 0;
     }
 
+    std::cout << "[Receiver] Captured " << packet_count << " packets\n";
+
+    auto t_flatten_start = high_resolution_clock::now();
     std::vector<unsigned char> flat_headers(packet_count * 20);
     for (int i = 0; i < packet_count; ++i)
         memcpy(flat_headers.data() + i * 20, ip_headers[i].data(), 20);
+    auto t_flatten_end = high_resolution_clock::now();
 
-    unsigned char *d_headers_20b, *d_modified_headers;
-    uint32_t *d_hashes, *d_payload_lengths;
-    unsigned char *d_key;
+    unsigned char *d_headers_20b, *d_modified_headers, *d_key;
+    uint32_t *d_hashes, *d_payload_lengths, *d_extracted_hashes;
+    uint8_t *d_match_flags;
 
+    auto t_memcpy1_start = high_resolution_clock::now();
     cudaMalloc(&d_headers_20b, packet_count * 20);
     cudaMalloc(&d_modified_headers, packet_count * 56);
     cudaMalloc(&d_hashes, packet_count * HASH_SIZE * sizeof(uint32_t));
     cudaMalloc(&d_payload_lengths, packet_count * sizeof(uint32_t));
     cudaMalloc(&d_key, 64);
+    cudaMalloc(&d_extracted_hashes, packet_count * HASH_SIZE * sizeof(uint32_t));
+    cudaMalloc(&d_match_flags, packet_count * sizeof(uint8_t));
 
     cudaMemcpy(d_headers_20b, flat_headers.data(), flat_headers.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(d_payload_lengths, payload_lengths.data(), packet_count * sizeof(uint32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_key, HMAC_KEY, 64, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_extracted_hashes, extracted_hashes.data(), packet_count * HASH_SIZE * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    auto t_memcpy1_end = high_resolution_clock::now();
 
     int threadsPerBlock = 256;
     int totalThreads = (packet_count + PACKETS_PER_THREAD - 1) / PACKETS_PER_THREAD;
     int numBlocks = (totalThreads + threadsPerBlock - 1) / threadsPerBlock;
 
+    auto t_kernel_start = high_resolution_clock::now();
     expandAndHashKernel<<<numBlocks, threadsPerBlock>>>(
-        d_headers_20b, packet_count, d_payload_lengths, d_hashes, d_key, d_modified_headers);
+        d_headers_20b, packet_count, d_payload_lengths,
+        d_hashes, d_key, d_modified_headers,
+        d_extracted_hashes, d_match_flags);
     cudaDeviceSynchronize();
+    auto t_kernel_end = high_resolution_clock::now();
 
-    std::vector<uint32_t> computed_hashes(packet_count * HASH_SIZE);
-    cudaMemcpy(computed_hashes.data(), d_hashes, computed_hashes.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-
-    std::vector<bool> match_flags(packet_count, true);
-    for (int i = 0; i < packet_count; ++i) {
-        for (int j = 0; j < HASH_SIZE; ++j) {
-            if (extracted_hashes[i * HASH_SIZE + j] != computed_hashes[i * HASH_SIZE + j]) {
-                match_flags[i] = false;
-                break;
-            }
-        }
-    }
-
+    auto t_memcpy2_start = high_resolution_clock::now();
     std::vector<uint8_t> match_bytes(packet_count);
-    for (int i = 0; i < packet_count; ++i)
-        match_bytes[i] = match_flags[i] ? 1 : 0;
+    cudaMemcpy(match_bytes.data(), d_match_flags, packet_count * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+    auto t_memcpy2_end = high_resolution_clock::now();
 
-    std::cout << "[Receiver] Sending " << packet_count << " match results...\n";
+    auto t_send_start = high_resolution_clock::now();
     ssize_t sent1 = send(client_fd, &packet_count, sizeof(packet_count), 0);
     if (sent1 != sizeof(packet_count)) {
         perror("[Receiver] Failed to send count");
@@ -428,9 +428,11 @@ int main() {
     if (sent2 != (ssize_t)match_bytes.size()) {
         perror("[Receiver] Failed to send match results");
     }
+    auto t_send_end = high_resolution_clock::now();
 
     std::cout << "[Receiver] Done sending match results.\n";
 
+    // Cleanup
     close(client_fd);
     close(server_fd);
     cudaFree(d_headers_20b);
@@ -438,6 +440,34 @@ int main() {
     cudaFree(d_hashes);
     cudaFree(d_payload_lengths);
     cudaFree(d_key);
+    cudaFree(d_extracted_hashes);
+    cudaFree(d_match_flags);
+
+    auto ms = [](auto start, auto end) {
+        return duration_cast<milliseconds>(end - start).count();
+    };
+
+    auto ns = [](auto start, auto end) {
+        return duration_cast<nanoseconds>(end - start).count();
+    };
+
+    std::cout << "\n--- Timing Report ---\n";
+    std::cout << "Packet reception       : " << ms(t_recv_start, t_recv_end) << " ms\n";
+    std::cout << "Flatten headers        : " << ns(t_flatten_start, t_flatten_end) << " ns\n";
+    std::cout << "Memcpy to device       : " << ns(t_memcpy1_start, t_memcpy1_end) << " ns\n";
+    std::cout << "Kernel execution       : " << ns(t_kernel_start, t_kernel_end) << " ns\n";
+    std::cout << "Memcpy from device     : " << ns(t_memcpy2_start, t_memcpy2_end) << " ns\n";
+    std::cout << "Match result send      : " << ns(t_send_start, t_send_end) << " ns\n";
+
+    if (packet_count > 0) {
+        std::cout << "\n--- Avg Per-Packet Timing (nanoseconds) ---\n";
+        std::cout << "Reception time         : " << (1.0 * ms(t_recv_start, t_recv_end) * 1e6 / packet_count) << " ns/packet\n";
+        std::cout << "Flatten headers        : " << ns(t_flatten_start, t_flatten_end) / packet_count << " ns/packet\n";
+        std::cout << "Memcpy to device       : " << ns(t_memcpy1_start, t_memcpy1_end) / packet_count << " ns/packet\n";
+        std::cout << "Kernel execution       : " << ns(t_kernel_start, t_kernel_end) / packet_count << " ns/packet\n";
+        std::cout << "Memcpy from device     : " << ns(t_memcpy2_start, t_memcpy2_end) / packet_count << " ns/packet\n";
+        std::cout << "Result send            : " << ns(t_send_start, t_send_end) / packet_count << " ns/packet\n";
+    }
 
     return 0;
 }
